@@ -1,8 +1,5 @@
-from fastapi import FastAPI
+from app.api import create_app
+from app.bootstrap import build_context
 
-app = FastAPI()
-
-
-@app.get("/")
-def read_root():
-    return {"Hello": "World"}
+ctx = build_context()
+app = create_app(ctx.store, ctx.clock, ctx.auth, ctx.guard)
