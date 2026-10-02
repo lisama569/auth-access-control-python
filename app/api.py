@@ -130,8 +130,37 @@ def create_app(store: Store, clock: Clock, auth: AuthService, guard: Guard) -> F
 
     @app.post("/admin/sessions/{sid}/revoke")
     def revoke_session(sid: str, request: Request) -> dict[str, Any]:
+        # 先认证、再鉴权；目标会话是否存在最后才判定，不向前者泄露
         guard.check(_bearer(request), "admin:revoke", None)
-        ok = auth.revoke_session(sid)
-        return {"scope": "session", "sid": sid, "revoked": ok}
+        result = auth.revoke_session_detailed(sid)
+        return {"scope": "session", "sid": sid, "revoked": True, "result": result}
+
+    @app.get("/admin/subjects/{username}/sessions")
+    def list_subject_sessions(username: str, request: Request) -> dict[str, Any]:
+        """按主体列出会话：标识、创建时间、状态；不返回任何令牌内容。"""
+        guard.check(_bearer(request), "admin:revoke", None)
+        views = auth.list_sessions(username)
+        return {
+            "subject": username,
+            "count": len(views),
+            "sessions": [
+                {
+                    "sid": v.sid,
+                    "created_at": v.created_at,
+                    "status": v.status,
+                    "revoked_at": v.revoked_at,
+                    "compromised_at": v.compromised_at,
+                    "rotation_seq": v.rotation_seq,
+                }
+                for v in views
+            ],
+        }
+
+    @app.post("/admin/subjects/{username}/sessions/revoke")
+    def revoke_subject_sessions(username: str, request: Request) -> dict[str, Any]:
+        """一次性注销该主体名下仍存活的会话；返回实际注销数量。"""
+        guard.check(_bearer(request), "admin:revoke", None)
+        count = auth.revoke_subject_sessions(username)
+        return {"scope": "subject_sessions", "subject": username, "revoked_count": count}
 
     return app

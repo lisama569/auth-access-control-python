@@ -42,9 +42,20 @@ class TokenRevoked(AuthError):
 
 
 class TokenReplayed(AuthError):
-    """刷新令牌已被轮换，再次使用即重放。"""
+    """刷新令牌已被轮换，再次使用即重放（兼容保留的结论码）。"""
 
     code = "refresh_replayed"
+    status_code = 401
+
+
+class RefreshChainRevoked(AuthError):
+    """已轮换掉的旧刷新令牌在容忍窗口之外（或更早的旧令牌）再次出现，
+
+    判定为凭证泄露：其所属令牌串（自那次登录起签发的全部访问/刷新令牌）
+    整体作废。该结论与普通会话注销(token_revoked)、过期、篡改严格可区分。
+    """
+
+    code = "refresh_chain_revoked"
     status_code = 401
 
 
@@ -67,4 +78,11 @@ class Forbidden(AuthError):
 
 class ResourceNotFound(AuthError):
     code = "resource_not_found"
+    status_code = 404
+
+
+class SessionNotFound(AuthError):
+    """治理目标会话不存在（从未有过），与"存在但已被清掉"严格区分。"""
+
+    code = "session_not_found"
     status_code = 404

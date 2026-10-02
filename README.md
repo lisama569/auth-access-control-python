@@ -1,12 +1,15 @@
 # 本地 API 认证与访问控制（Python / FastAPI）
 
 一个**完全本地运行、无外部依赖服务**的认证与访问控制演示：令牌在本地用 HMAC 签发，
-身份、角色、权限、会话与吊销台账全部保存在进程内存中。重点是把以下三件事做到
+身份、角色、权限、会话与吊销台账全部保存在进程内存中。重点是把以下几件事做到
 **结论可区分、状态确定、判定依据可在日志中解释**：
 
-1. 访问令牌 / 刷新令牌的签发、刷新轮换（过期、篡改、重放、并发竞争）；
-2. 基于角色与权限范围的访问控制（未认证 / 越权 / 资源不存在严格可区分）+ 三种粒度吊销；
-3. 权限模型演进的即时语义与时钟偏移下的确定性临界判定。
+1. 访问令牌 / 刷新令牌的签发、刷新轮换（过期、篡改、并发竞争）；
+2. **旧刷新令牌重复使用的安全处置**：短窗口内幂等重试 vs 窗口外（或更早旧令牌）
+   判定泄露并把**整串令牌作废**，结论与普通注销/过期/篡改严格可区分；
+3. 基于角色与权限范围的访问控制（未认证 / 越权 / 资源不存在严格可区分）+ 三种粒度吊销；
+4. **按主体的会话治理**：列会话、批量注销，沿用"认证→鉴权→目标存在性"顺序；
+5. 权限模型演进的即时语义与时钟偏移下的确定性临界判定。
 
 ## 运行
 
@@ -25,25 +28,30 @@ uv run pytest -s -o log_cli=true -o log_cli_level=INFO
 # 或安静模式：uv run pytest -q
 ```
 
-39 个用例，分布：
+53 个用例（原有 39 个全部保留并按新语义更新），分布：
 
 | 文件 | 覆盖内容 |
 | --- | --- |
 | `tests/test_token_lifecycle.py` | 登录、过期、签名/负载篡改、令牌类型误用、缺失令牌、过期等号边界、正负时钟偏移与容差 |
-| `tests/test_refresh_rotation.py` | 正常轮换、旧令牌重放、重放不影响最新令牌、8 线程并发恰好一次成功、刷新过期 |
-| `tests/test_concurrent_service.py` | 服务层真实锁内交错，覆盖 `refresh_conflict`（409）竞争分支与串行轮换链 |
+| `tests/test_refresh_rotation.py` | 正常轮换、**窗口内幂等重试（令牌对相同、链不双推进）**、**窗口外/更早旧令牌整串作废**、等号窗口边界、8 线程并发恰好一次真正轮换、刷新过期 |
+| `tests/test_concurrent_service.py` | 服务层真实锁内交错，覆盖 `refresh_conflict`（409）竞争分支、竞争后窗口内回放、串行轮换夹重试、窗口外整串作废 |
 | `tests/test_access_control.py` | 401/403/404 可区分、会话/主体/全局三种吊销、吊销后重新登录、非管理员不能吊销 |
 | `tests/test_permission_evolution.py` | 角色权限新增/收窄对**既有令牌**即时生效、逐条独立、轮换令牌同样跟随 |
 | `tests/test_decision_ordering.py` | 多重失败叠加时的固定归类优先级、`now == exp` 临界确定性 |
+| `tests/test_refresh_leak_and_sessions.py` | 整串作废后访问拒绝且与普通注销区分、作废不影响重新登录、过期优先于作废、按主体列会话（不暴露令牌）、`revoked/compromised` 状态、批量注销后重新登录入列、单会话注销三态、治理入口认证/鉴权顺序 |
 
 `auth` / `access` logger 在每次判定时打印**判定依据**（user/sid/jti/required/held）
-与**关键令牌状态变化**（签发、轮换 old_jti→new_jti、chain_len、吊销点、冲突）。
+与**关键令牌/会话状态变化**（签发、轮换 old_jti→new_jti、seq、chain_len、
+窗口内重试命中的是第几次轮换 `refresh_retry_replayed`、判定泄露时的
+`outside_window`/`older_rotation` 依据与整串作废时间、吊销点、冲突）。
 
 ## HTTP 接口
 
 ### 认证
 - `POST /auth/login` `{username,password}` → `{access_token, refresh_token, ...}`
 - `POST /auth/refresh` `{refresh_token}` → 全新令牌对（旧刷新令牌立即失效）
+  - 容忍窗口内重复提交**上一次刚用掉**的刷新令牌：原样回放第一次返回的令牌对
+    （幂等重试，会话不二次推进）。
 
 ### 受保护资源（Bearer Token）
 - `GET /docs/{id}` 需要 `doc:read`
@@ -53,8 +61,15 @@ uv run pytest -s -o log_cli=true -o log_cli_level=INFO
 ### 管理端（需要 `admin:revoke`）
 - `POST /admin/roles/permissions` `{role,permission}` 角色新增权限
 - `DELETE /admin/roles/permissions` `{role,permission}` 角色收窄权限
-- `POST /admin/sessions/{sid}/revoke` —— 会话级吊销（`sid` 可从令牌 `sid` 字段得到）
-- `POST /admin/revoke/subject/{username}` —— 主体级吊销
+- `POST /admin/sessions/{sid}/revoke` —— 会话级吊销（`sid` 可从令牌 `sid` 字段得到），
+  返回 `result`：`revoked`（本次刚注销）/ `already_revoked`（此前已是终态）；
+  会话从不存在时返回 404 `session_not_found`
+- `GET /admin/subjects/{username}/sessions` —— 按主体列出会话
+  （`sid`/`created_at`/`status`/`rotation_seq` 等，**不含任何令牌内容**）；
+  `status ∈ active | revoked | compromised`
+- `POST /admin/subjects/{username}/sessions/revoke` —— 一次性注销该主体名下仍存活的
+  会话，返回 `revoked_count`（已注销/已作废的不重复计数）
+- `POST /admin/revoke/subject/{username}` —— 主体级吊销（时间戳语义）
 - `POST /admin/revoke/all` —— 全局吊销
 
 种子账号：`alice/alice-pw`（admin）、`bob/bob-pw`（editor）、`carol/carol-pw`（viewer）；
@@ -70,11 +85,13 @@ uv run pytest -s -o log_cli=true -o log_cli_level=INFO
 | 401 | `invalid_credentials` | 用户名/密码错误 |
 | 401 | `token_tampered` | 结构非法、签名不匹配、算法/类型不支持、访问/刷新令牌混用 |
 | 401 | `token_expired` | 已过期（临界规则见下） |
-| 401 | `token_revoked` | 会话/主体/全局吊销，或会话已不存在 |
-| 401 | `refresh_replayed` | 刷新令牌已被轮换过，再次使用即重放 |
-| 409 | `refresh_conflict` | 并发刷新竞争失败（另一个请求已完成轮换） |
+| 401 | `token_revoked` | 会话/主体/全局吊销（普通注销），或会话已不存在 |
+| 401 | `refresh_chain_revoked` | 已轮换掉的旧刷新令牌在容忍窗口外（或更早的旧令牌）再次使用，判定凭证泄露，**该会话整串令牌作废** |
+| ~~401~~ | ~~`refresh_replayed`~~ | 旧结论码保留在错误类中以兼容；新语义下不再返回（窗口内回放返回 200，窗口外返回 `refresh_chain_revoked`） |
+| 409 | `refresh_conflict` | 真正同一时刻的并发刷新竞争失败（读到"未使用"快照但 CAS 失败） |
 | 403 | `forbidden` | 已认证但缺少所需权限（`reason=missing_permission:<p>`） |
 | 404 | `resource_not_found` | **权限通过后**才判定的资源缺失 |
+| 404 | `session_not_found` | **认证+鉴权通过后**才判定的治理目标会话不存在（与"存在但已被清掉"区分） |
 
 ## 令牌生命周期
 
@@ -89,21 +106,54 @@ payload = {jti, sub, sid, kind, iat, exp, ver}   # kind ∈ access|refresh
 - **访问令牌** TTL 15 分钟；**刷新令牌** TTL 7 天（`AuthConfig` 可调）。
 - 登录为每个会话签发一对令牌；刷新**轮换**两者，刷新令牌沿单链推进
   `R0 → R1 → R2 …`，会话在任一时刻只记录一个 `current_refresh_jti`。
-- 轮换由存储层 CAS 原语 `rotate_refresh(sid, expected, new)` 在全局锁内原子完成：
-  仅当 `current == expected` 才切换，旧 jti 入"已使用表"。
-- 旧刷新令牌再使用的归类：
-  - 若已在已使用表中 → `401 refresh_replayed`（恶意/迟到重放）；
-  - 若请求读到"未使用"快照但 CAS 失败 → `409 refresh_conflict`（并发竞争）。
-    并发场景下**至多一个请求成功**，失败不回滚、状态不前进两次，会话永远确定。
-- 访问令牌不随刷新失效（二者各自独立过期/吊销）；刷新只保证刷新令牌链的唯一性。
+- 轮换由存储层 CAS 原语 `rotate_refresh(sid, expected, record)` 在全局锁内原子完成：
+  仅当 `current == expected` 才切换，旧 jti 入"已使用表"，并在**同一临界区**固化
+  一条以旧 jti 为键的轮换记录（`RotationRecord`：轮换时间、序号、当时签发的令牌对）。
+
+### 旧刷新令牌再次使用：重试容忍窗口 vs 泄露整串作废
+
+一个已经被轮换掉的旧刷新令牌再次出现，分三种**确定可区分**的结论：
+
+1. **窗口内幂等重试 → 200（原样回放）**
+   客户端网络抖动重试很常见。若同时满足：
+   - 该旧 jti 的轮换记录属于**本会话的最近一次**轮换（`record.seq == 当前 seq`）；
+   - 距今 `now - rotated_at ≤ retry_window`（**等号成立算窗口内**，边界确定）；
+
+   则视为同一次刷新的重试，把第一次成功时返回的那一对新令牌**原样再返回一次**：
+   会话不二次推进（`rotation_seq` 与链长不变）、不判泄露。
+
+2. **窗口外 / 更早的旧令牌 → 401 `refresh_chain_revoked`（整串作废）**
+   真实世界里一个已换掉的旧刷新令牌在窗口外冒出来，基本可视为凭证泄露；
+   拿**更早之前**的旧令牌（如链已到 R2 再拿 R0）即使没超窗口同样视为泄露。
+   此时把它所在的会话**整串作废**（会话置 `compromised` 终态）：
+   - 自那次登录起发出的**访问令牌**访问资源一律 401 `refresh_chain_revoked`；
+   - 该串里**任何**刷新令牌（含最新的）都不再放行；
+   - 该结论独立于普通注销（`token_revoked`）、过期（`token_expired`）、
+     篡改（`token_tampered`），日志与会话列表 `status=compromised` 都能直接看出。
+
+3. **真正同一时刻的并发竞争 → 409 `refresh_conflict`**
+   多个请求都读到该 jti"尚未使用"的快照后抢 CAS，至多一个真正轮换成功，
+   其余 CAS 失败返回 409。竞争结束后窗口内的重复提交按第 1 种幂等回放，
+   因此并发**不会**被误判成泄露，会话也永远确定。
+
+- 容忍窗口默认 **5 秒**，由 `AuthConfig.retry_window` 配置；时间全部取自可注入
+  `Clock`，同一时刻反复判定结论一致。
+- **整串作废与重新登录**：作废的只是那一个会话（令牌串），不影响该主体的其他会话，
+  也**不阻止重新登录**；作废后重新登录得到的是全新会话（新 `sid`），令牌照常可用，
+  并作为 `active` 出现在会话列表中。
+- 访问令牌不随正常刷新失效（二者各自独立过期/吊销）；但整串作废会连带该串的访问
+  令牌——这正是"泄露"语义与普通轮换的区别。
 
 ### 固定判定顺序（多重失败叠加时无歧义）
 
 ```
-结构/签名 → 令牌类型 → 过期 → 会话存在性/会话吊销 → 主体|全局吊销 → 重放/冲突(仅刷新)
+结构/签名 → 令牌类型 → 过期 → 会话存在性 → 泄露整串作废 → 普通会话注销
+        → 主体|全局吊销 → 刷新窗口内回放/泄露/冲突(仅刷新)
 ```
-例如"又过期又被吊销"归类为 `token_expired`；"签名非法且主体已吊销"归类为
-`token_tampered`——令牌本身先站得住，才讨论吊销/重放。
+例如"又过期又被整串作废"归类为 `token_expired`；"签名非法且主体已吊销"归类为
+`token_tampered`——令牌本身先站得住，才讨论吊销/重放；
+"会话已因泄露作废又被管理员注销"对令牌判定归类为 `refresh_chain_revoked`，
+治理操作则返回 `already_revoked`。
 
 ## 权限与吊销语义
 
@@ -133,10 +183,37 @@ payload = {jti, sub, sid, kind, iat, exp, ver}   # kind ∈ access|refresh
 | 主体 | 记录 `subject_revoked_at[sub]` | 该主体 `iat ≤ 吊销时间` 的令牌失效 |
 | 全局 | 记录 `global_revoked_at` | 所有主体 `iat ≤ 吊销时间` 的令牌失效 |
 
+另有一类**安全终态**与普通注销并列但相互独立：
+
+| 终态 | 触发 | 效果 |
+| --- | --- | --- |
+| 泄露整串作废 | 旧刷新令牌窗口外/跨轮换再次出现，`compromise_session(sid)` 置 `compromised_at` | 该会话整串访问/刷新令牌一律 401 `refresh_chain_revoked`，在会话列表中为 `compromised` |
+
+- `compromised` 与 `revoked` 都是终态；对令牌的失败结论以 `compromised` 优先，
+  但普通注销路径仍稳定返回 `token_revoked`，排查时两类失效不会混在一起。
 - 主体级与全局吊销时间取**较晚者**生效。
 - 吊销**不阻止重新登录**：吊销点之后签发的新令牌（`iat > revoked_at`）照常可用，
-  对应"全部退出登录"后再次登录的直觉。
+  对应"全部退出登录"后再次登录的直觉。整串作废同理（它只波及被作废的那一会话）。
 - 会话吊销是布尔终态：该 sid 下任何令牌（含刷新轮换得到的新令牌）都不可用。
+
+## 按主体的会话治理
+
+- `GET /admin/subjects/{username}/sessions`：返回该主体全部会话（含已注销/已作废），
+  字段为 `sid / created_at / status / revoked_at / compromised_at / rotation_seq`，
+  **只暴露标识与状态，绝不返回令牌或 jti 内容**；`status`：
+  - `active` 正常可用；
+  - `revoked` 普通注销 / 会话级吊销；
+  - `compromised` 因旧刷新令牌重放被判泄露、整串作废。
+- `POST /admin/subjects/{username}/sessions/revoke`：一次性注销该主体名下所有
+  `active` 会话，返回 `revoked_count`；`revoked`/`compromised` 的不重复计数，
+  再次调用返回 0（幂等）。注销后该主体重新登录照常成功，新会话以 `active` 入列。
+- `POST /admin/sessions/{sid}/revoke` 的返回 `result` 三态可区分：
+  `revoked`（本来存在、本次刚清掉）/ `already_revoked`（此前已注销或已作废）/
+  HTTP 404 `session_not_found`（该 sid 从不存在）。
+- 所有治理入口与资源访问一样，严格按
+  **① 认证 → ② 权限（`admin:revoke`）→ ③ 目标存在性** 的顺序判定：
+  未认证一律 401、无权一律 403（此时不会透露目标会话/主体是否存在），
+  只有认证与权限都通过后，才可能得到 404/200。
 
 ## 时钟与过期的确定性语义
 
@@ -155,14 +232,32 @@ payload = {jti, sub, sid, kind, iat, exp, ver}   # kind ∈ access|refresh
 
 ```
 app/
-  errors.py          # 错误类型 → error 码 / HTTP 状态码
+  errors.py          # 错误类型 → error 码 / HTTP 状态码（含 refresh_chain_revoked / session_not_found）
   clock.py           # 可控时钟（推进 / 偏移）
   tokens.py          # Claims、HMAC 签发/验签、过期临界判定
-  storage.py         # 线程安全内存存储 + CAS 轮换原语 + 吊销台账 + 实时权限聚合
-  auth_service.py    # 登录签发 / 刷新轮换状态机 / authenticate / 吊销
+  storage.py         # 线程安全内存存储 + CAS 轮换原语(含 RotationRecord) + 泄露终态 +
+                     # 吊销台账 + 实时权限聚合 + 按主体会话视图/批量注销
+  auth_service.py    # 登录签发 / 刷新窗口重试·泄露整串作废·并发状态机 / authenticate / 吊销 / 会话治理
   access_control.py  # 认证→鉴权→资源 三段式 Guard
-  api.py             # FastAPI 路由与统一 AuthError 处理
+  api.py             # FastAPI 路由与统一 AuthError 处理（含会话治理端点）
   bootstrap.py       # 种子数据与组装
-tests/               # 39 个用例（见上表）
+tests/               # 53 个用例（见上表）
+scripts/smoke.py     # 端到端冒烟（含窗口重试、整串作废、会话治理）
 main.py              # ASGI 入口
+```
+
+## 与既有能力的兼容范围
+
+- 登录、访问、过期/篡改判定、三种粒度吊销、权限实时演进、确定性时钟语义**全部不变**。
+- 刷新接口在"正常轮换"与"真正并发竞争（409）"两种情形下的行为不变。
+- 唯一的行为变化是旧刷新令牌的**事后重放**：旧版本一律 401 `refresh_replayed`；
+  新版本改为——窗口内 200 幂等回放、窗口外（或跨轮换的更早旧令牌）401
+  `refresh_chain_revoked` 并整串作废。错误类 `TokenReplayed` 与错误码
+  `refresh_replayed` 保留在代码中以兼容旧引用，但接口不再返回。
+- 本地验证：
+
+```bash
+uv run pytest -s -o log_cli=true -o log_cli_level=INFO   # 全量用例 + 判定日志
+uv run python scripts/smoke.py                            # 端到端冒烟
+uv run uvicorn main:app --reload                          # 交互调试 http://127.0.0.1:8000/docs
 ```
