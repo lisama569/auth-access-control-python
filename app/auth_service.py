@@ -1,16 +1,25 @@
-"""认证服务：登录签发、刷新轮换（含重放/并发判定）、令牌校验、吊销。
+"""认证服务：登录签发、刷新轮换（重试窗口/泄露检测/并发判定）、令牌校验、吊销。
 
 刷新轮换的状态机（每个会话只认一个"当前刷新令牌"）：
 
     登录 -> 会话(current=R0)
-    用 R0 刷新成功 -> 会话(current=R1)，R0 记入已使用表
+    用 R0 刷新成功 -> 会话(current=R1)，R0 记入已使用表，
+                      并记录最近一次轮换（old=R0, pair=新令牌对, rotated_at）
     再次用 R0：
+      - 在重复提交容忍窗口内（now - rotated_at < window，等号即超出）
+        => 幂等重试：原样返回第一次成功时签发的那对令牌，会话不推进第二次
+      - 超出窗口，或拿更早之前的旧刷新令牌
+        => 判定凭证泄露：整串令牌（本次登录签发的访问+刷新）立即作废，
+           抛 refresh_reuse_detected
       - 若该请求在 R0 被标记前已读到"未使用"，且 CAS 失败 => 并发冲突 409
-      - 否则 => 重放 401(refresh_replayed)
 
 吊销采用时间戳语义：iat <= 吊销时间 的令牌一律失效；
 主体级与全局吊销取较晚者。吊销只影响吊销点之前签发的令牌，
 吊销之后重新登录签发的新令牌不受影响（类似"全部退出"后重新登录）。
+
+会话级失效分两种可区分原因（revoked_reason）：
+    admin          常规注销（管理端/批量注销）
+    reuse_detected 旧刷新令牌重复使用导致整串作废
 """
 from __future__ import annotations
 
@@ -22,13 +31,14 @@ from .clock import Clock
 from .errors import (
     InvalidCredentials,
     RefreshConflict,
+    RefreshReuseDetected,
     TokenExpired,
-    TokenReplayed,
+    TokenFamilyRevoked,
     TokenRevoked,
     TokenTampered,
     Unauthenticated,
 )
-from .storage import Store
+from .storage import REASON_REUSE_DETECTED, Store
 from .tokens import ACCESS, REFRESH, Claims, TokenPair, decode, encode, is_expired
 
 log = logging.getLogger("auth")
@@ -36,6 +46,7 @@ log = logging.getLogger("auth")
 ACCESS_TTL = 900  # 访问令牌有效期 15 分钟
 REFRESH_TTL = 60 * 60 * 24 * 7  # 刷新令牌有效期 7 天
 LEEWAY = 0.0  # 过期容差（秒）；临界测试中显式配置
+RETRY_WINDOW = 2.0  # 重复提交容忍窗口（秒）：窗口内重试返回首次签发的令牌对
 
 
 @dataclass
@@ -44,6 +55,7 @@ class AuthConfig:
     access_ttl: int = ACCESS_TTL
     refresh_ttl: int = REFRESH_TTL
     leeway: float = LEEWAY
+    refresh_retry_window: float = RETRY_WINDOW
 
 
 def _new_jti() -> str:
@@ -110,23 +122,53 @@ class AuthService:
                      claims.jti[:8], claims.sid)
             raise TokenTampered("刷新令牌对应的会话不存在")
         if session.revoked:
+            if session.revoked_reason == REASON_REUSE_DETECTED:
+                log.info(
+                    "刷新被拒 user=%s sid=%s jti=%s reason=refresh_reuse_detected "
+                    "detail=family_already_invalidated",
+                    claims.sub, session.sid, claims.jti[:8],
+                )
+                raise RefreshReuseDetected(
+                    "该会话已因刷新令牌重复使用被整串作废，请重新登录"
+                )
             log.info("刷新被拒 user=%s sid=%s reason=session_revoked",
                      claims.sub, session.sid)
             raise TokenRevoked("会话已被吊销")
 
         self._check_revocation(claims)
 
-        # 先读一次"是否已被使用"快照：用于区分恶意重放与并发竞争
+        # 先读一次"是否已被使用"快照：用于区分重试/泄露与并发竞争
         seen_used = self.store.was_refresh_used(claims.jti)
         if seen_used:
-            log.info(
-                "刷新被拒 user=%s sid=%s jti=%s reason=refresh_replayed chain_len=%d",
-                claims.sub, claims.sid, claims.jti[:8], len(session.refresh_chain),
+            retry_pair = self.store.match_retry(
+                claims.sid, claims.jti, now, self.config.refresh_retry_window
             )
-            raise TokenReplayed("该刷新令牌已被轮换，禁止重放")
+            if retry_pair is not None:
+                rot = session.last_rotation
+                log.info(
+                    "刷新重试命中 user=%s sid=%s jti=%s reason=retry_within_window "
+                    "rotated_at=%.3f now=%.3f window=%.3f new_jti=%s "
+                    "detail=返回首次轮换签发的令牌对，会话不推进",
+                    claims.sub, claims.sid, claims.jti[:8],
+                    rot.rotated_at, now, self.config.refresh_retry_window,
+                    rot.new_jti[:8],
+                )
+                return retry_pair
+            # 超出窗口或更早的旧令牌：判定凭证泄露，整串作废
+            self.store.invalidate_family(claims.sid, now)
+            log.info(
+                "刷新泄露检测 user=%s sid=%s jti=%s reason=refresh_reuse_detected "
+                "chain_len=%d detail=旧刷新令牌重复使用，整串令牌作废 at=%.3f",
+                claims.sub, claims.sid, claims.jti[:8],
+                len(session.refresh_chain), now,
+            )
+            raise RefreshReuseDetected(
+                "检测到已被轮换的旧刷新令牌再次使用，该会话整串令牌已作废"
+            )
 
         new_jti = _new_jti()
-        swapped = self.store.rotate_refresh(claims.sid, claims.jti, new_jti, now)
+        pair = self._issue_pair(claims.sid, claims.sub, new_jti, now)
+        swapped = self.store.rotate_refresh(claims.sid, claims.jti, new_jti, now, pair)
         if not swapped:
             log.info(
                 "刷新竞争失败 user=%s sid=%s jti=%s reason=refresh_conflict current=%s",
@@ -135,7 +177,6 @@ class AuthService:
             )
             raise RefreshConflict("并发刷新冲突：该刷新令牌已被另一个请求轮换")
 
-        pair = self._issue_pair(claims.sid, claims.sub, new_jti, now)
         log.info(
             "刷新成功 user=%s sid=%s old_jti=%s new_jti=%s chain_len=%d",
             claims.sub, claims.sid, claims.jti[:8], new_jti[:8],
@@ -164,6 +205,15 @@ class AuthService:
                      claims.jti[:8], claims.sid)
             raise TokenRevoked("会话不存在或已终结")
         if session.revoked:
+            if session.revoked_reason == REASON_REUSE_DETECTED:
+                log.info(
+                    "访问被拒 user=%s sid=%s jti=%s reason=token_family_revoked "
+                    "detail=刷新令牌重复使用导致整串作废",
+                    claims.sub, claims.sid, claims.jti[:8],
+                )
+                raise TokenFamilyRevoked(
+                    "该会话因刷新令牌重复使用已整串作废，请重新登录"
+                )
             log.info("访问被拒 user=%s sid=%s reason=session_revoked",
                      claims.sub, claims.sid)
             raise TokenRevoked("会话已被吊销")
@@ -199,10 +249,11 @@ class AuthService:
             raise TokenRevoked(f"令牌在{scope}级吊销点之前签发，已被吊销")
 
     # ---- 吊销 ----
-    def revoke_session(self, sid: str) -> bool:
-        ok = self.store.revoke_session(sid, self.clock.now())
-        log.info("吊销会话 sid=%s ok=%s", sid, ok)
-        return ok
+    def revoke_session(self, sid: str) -> str:
+        """注销单个会话；返回 revoked / already_revoked / not_found。"""
+        status = self.store.revoke_session(sid, self.clock.now())
+        log.info("吊销会话 sid=%s status=%s", sid, status)
+        return status
 
     def revoke_subject(self, username: str) -> None:
         self.store.revoke_subject(username, self.clock.now())
@@ -211,3 +262,32 @@ class AuthService:
     def revoke_all(self) -> None:
         self.store.revoke_all(self.clock.now())
         log.info("全局吊销 at=%.3f", self.clock.now())
+
+    # ---- 会话治理（按主体） ----
+    def list_sessions(self, username: str) -> list[dict]:
+        """列出主体名下会话的安全视图：不含任何令牌内容与 jti。"""
+        views: list[dict] = []
+        for s in self.store.sessions_of(username):
+            views.append({
+                "sid": s.sid,
+                "subject": s.subject,
+                "created_at": s.created_at,
+                "status": "revoked" if s.revoked else "active",
+                "revoked_reason": s.revoked_reason,
+                "rotations": len(s.refresh_chain) - 1,
+            })
+        log.info(
+            "列出会话 user=%s count=%d active=%d",
+            username, len(views),
+            sum(1 for v in views if v["status"] == "active"),
+        )
+        return views
+
+    def revoke_subject_sessions(self, username: str) -> list[str]:
+        """一次性注销主体名下所有仍活着的会话；返回本次实际注销的 sid。"""
+        revoked = self.store.revoke_subject_sessions(username, self.clock.now())
+        log.info(
+            "批量注销会话 user=%s revoked_count=%d sids=%s",
+            username, len(revoked), ",".join(revoked) or "(none)",
+        )
+        return revoked

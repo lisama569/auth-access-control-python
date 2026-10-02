@@ -16,7 +16,7 @@ from pydantic import BaseModel
 from .access_control import Guard
 from .auth_service import AuthService
 from .clock import Clock
-from .errors import AuthError
+from .errors import AuthError, ResourceNotFound
 from .storage import Store
 from .tokens import decode
 
@@ -131,7 +131,35 @@ def create_app(store: Store, clock: Clock, auth: AuthService, guard: Guard) -> F
     @app.post("/admin/sessions/{sid}/revoke")
     def revoke_session(sid: str, request: Request) -> dict[str, Any]:
         guard.check(_bearer(request), "admin:revoke", None)
-        ok = auth.revoke_session(sid)
-        return {"scope": "session", "sid": sid, "revoked": ok}
+        status = auth.revoke_session(sid)
+        if status == "not_found":
+            raise ResourceNotFound(f"会话 {sid} 不存在")
+        body: dict[str, Any] = {"scope": "session", "sid": sid, "status": status}
+        session = store.get_session(sid)
+        if session is not None:
+            body["revoked_reason"] = session.revoked_reason
+        return body
+
+    # ---------- 会话治理（按主体） ----------
+    @app.get("/admin/subjects/{username}/sessions")
+    def list_subject_sessions(username: str, request: Request) -> dict[str, Any]:
+        # 顺序固定：认证(401) -> 权限(403) -> 目标存在性(404)
+        guard.check(_bearer(request), "admin:sessions", None)
+        if store.get_user(username) is None:
+            raise ResourceNotFound(f"主体 {username} 不存在")
+        sessions = auth.list_sessions(username)
+        return {"subject": username, "count": len(sessions), "sessions": sessions}
+
+    @app.post("/admin/subjects/{username}/sessions/revoke")
+    def revoke_subject_sessions(username: str, request: Request) -> dict[str, Any]:
+        guard.check(_bearer(request), "admin:sessions", None)
+        if store.get_user(username) is None:
+            raise ResourceNotFound(f"主体 {username} 不存在")
+        revoked = auth.revoke_subject_sessions(username)
+        return {
+            "subject": username,
+            "revoked_count": len(revoked),
+            "revoked_sids": revoked,
+        }
 
     return app

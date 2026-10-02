@@ -8,6 +8,17 @@ from __future__ import annotations
 import threading
 from dataclasses import dataclass, field
 
+from .tokens import TokenPair
+
+# 会话失效原因（revoked_reason 取值）
+REASON_ADMIN = "admin"               # 常规注销（管理端/用户主动）
+REASON_REUSE_DETECTED = "reuse_detected"  # 旧刷新令牌重复使用，整串作废
+
+# 会话注销结果（可区分）
+REVOKE_OK = "revoked"
+REVOKE_ALREADY = "already_revoked"
+REVOKE_NOT_FOUND = "not_found"
+
 
 @dataclass
 class User:
@@ -31,6 +42,20 @@ class Resource:
 
 
 @dataclass
+class RotationRecord:
+    """最近一次成功轮换的记录，用于重复提交容忍窗口内的幂等重试。
+
+    pair 为第一次成功时签发的令牌对；窗口内的重试原样返回它，
+    会话不推进第二次。
+    """
+
+    old_jti: str
+    new_jti: str
+    rotated_at: float
+    pair: TokenPair
+
+
+@dataclass
 class Session:
     sid: str
     subject: str
@@ -39,6 +64,8 @@ class Session:
     created_at: float = 0.0
     revoked: bool = False
     revoked_at: float | None = None
+    revoked_reason: str | None = None  # REASON_ADMIN / REASON_REUSE_DETECTED
+    last_rotation: RotationRecord | None = None
 
 
 class Store:
@@ -128,13 +155,15 @@ class Store:
             return self.sessions.get(sid)
 
     def rotate_refresh(
-        self, sid: str, expected_jti: str, new_jti: str, now: float
+        self, sid: str, expected_jti: str, new_jti: str, now: float,
+        pair: TokenPair | None = None,
     ) -> bool:
         """CAS 轮换刷新令牌。
 
         仅当会话存在、未被吊销、且当前刷新 jti 恰为 expected_jti 时，
         原子地把当前 jti 切换为 new_jti 并把旧 jti 记入已使用表；
         否则返回 False。并发刷新中至多一个请求成功。
+        成功时若携带 pair，则记录为最近一次轮换（供容忍窗口内幂等重试）。
         """
         with self.lock:
             session = self.sessions.get(sid)
@@ -145,7 +174,33 @@ class Store:
             session.current_refresh_jti = new_jti
             session.refresh_chain.append(new_jti)
             self.used_refresh_jti[expected_jti] = now
+            if pair is not None:
+                session.last_rotation = RotationRecord(
+                    old_jti=expected_jti, new_jti=new_jti,
+                    rotated_at=now, pair=pair,
+                )
             return True
+
+    def match_retry(
+        self, sid: str, jti: str, now: float, window: float
+    ) -> TokenPair | None:
+        """重复提交容忍窗口判定（确定性边界）。
+
+        仅当 jti 恰为"上一次刚被轮换掉的那个刷新令牌"、且
+        now - rotated_at < window（等号即超出窗口）时，
+        返回第一次成功时签发的令牌对；否则返回 None。
+        更早之前的旧令牌、或超出窗口，一律返回 None（按泄露处理）。
+        """
+        with self.lock:
+            session = self.sessions.get(sid)
+            if session is None or session.revoked:
+                return None
+            rot = session.last_rotation
+            if rot is None or rot.old_jti != jti:
+                return None
+            if now - rot.rotated_at >= window:
+                return None
+            return rot.pair
 
     def mark_refresh_used(self, jti: str, now: float) -> None:
         with self.lock:
@@ -156,15 +211,56 @@ class Store:
             return jti in self.used_refresh_jti
 
     # ---- 吊销 ----
-    def revoke_session(self, sid: str, now: float) -> bool:
+    def revoke_session(self, sid: str, now: float, reason: str = REASON_ADMIN) -> str:
+        """注销单个会话；返回可区分结果：revoked / already_revoked / not_found。"""
         with self.lock:
             session = self.sessions.get(sid)
             if session is None:
+                return REVOKE_NOT_FOUND
+            if session.revoked:
+                return REVOKE_ALREADY
+            session.revoked = True
+            session.revoked_at = now
+            session.revoked_reason = reason
+            return REVOKE_OK
+
+    def invalidate_family(self, sid: str, now: float) -> bool:
+        """因刷新令牌重复使用，把该次登录签发的整串令牌作废。
+
+        置会话为吊销终态并标记 revoked_reason=reuse_detected，
+        使这一串的访问令牌与刷新令牌全部失效，且与常规注销可区分。
+        """
+        with self.lock:
+            session = self.sessions.get(sid)
+            if session is None or session.revoked:
                 return False
-            if not session.revoked:
-                session.revoked = True
-                session.revoked_at = now
+            session.revoked = True
+            session.revoked_at = now
+            session.revoked_reason = REASON_REUSE_DETECTED
             return True
+
+    # ---- 会话治理（按主体） ----
+    def sessions_of(self, subject: str) -> list[Session]:
+        """列出主体名下全部会话（含已失效），按创建时间排序。"""
+        with self.lock:
+            return sorted(
+                (s for s in self.sessions.values() if s.subject == subject),
+                key=lambda s: (s.created_at, s.sid),
+            )
+
+    def revoke_subject_sessions(
+        self, subject: str, now: float, reason: str = REASON_ADMIN
+    ) -> list[str]:
+        """一次性注销主体名下所有仍活着的会话；返回本次实际注销的 sid 列表。"""
+        with self.lock:
+            revoked: list[str] = []
+            for session in self.sessions.values():
+                if session.subject == subject and not session.revoked:
+                    session.revoked = True
+                    session.revoked_at = now
+                    session.revoked_reason = reason
+                    revoked.append(session.sid)
+            return revoked
 
     def revoke_subject(self, username: str, now: float) -> None:
         with self.lock:

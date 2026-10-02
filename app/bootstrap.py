@@ -1,7 +1,7 @@
 """组装演示数据与服务：角色、权限、用户、资源。
 
 种子数据：
-- 角色 admin：  doc:read, doc:write, doc:delete, admin:revoke
+- 角色 admin：  doc:read, doc:write, doc:delete, admin:revoke, admin:sessions
 - 角色 editor： doc:read, doc:write
 - 角色 viewer： doc:read
 - 用户 alice(admin) / bob(editor) / carol(viewer)
@@ -16,7 +16,7 @@ from .auth_service import AuthConfig, AuthService
 from .clock import Clock
 from .storage import Resource, Role, Store, User
 
-ADMIN_PERMS = {"doc:read", "doc:write", "doc:delete", "admin:revoke"}
+ADMIN_PERMS = {"doc:read", "doc:write", "doc:delete", "admin:revoke", "admin:sessions"}
 EDITOR_PERMS = {"doc:read", "doc:write"}
 VIEWER_PERMS = {"doc:read"}
 

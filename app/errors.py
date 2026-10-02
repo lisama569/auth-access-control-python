@@ -41,10 +41,24 @@ class TokenRevoked(AuthError):
     status_code = 401
 
 
-class TokenReplayed(AuthError):
-    """刷新令牌已被轮换，再次使用即重放。"""
+class RefreshReuseDetected(AuthError):
+    """已被轮换掉的旧刷新令牌在容忍窗口之外再次被使用。
 
-    code = "refresh_replayed"
+    判定为凭证泄露：该次登录签发的整串令牌（访问+刷新）立即作废，
+    此后再拿这一串里的任何刷新令牌来都归入本错误。
+    """
+
+    code = "refresh_reuse_detected"
+    status_code = 401
+
+
+class TokenFamilyRevoked(AuthError):
+    """访问令牌所属的令牌串已因刷新令牌重复使用被整串作废。
+
+    与普通会话注销（token_revoked）明确区分，便于排查泄露事件。
+    """
+
+    code = "token_family_revoked"
     status_code = 401
 
 
