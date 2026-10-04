@@ -31,6 +31,7 @@ from .errors import (
     RefreshChainRevoked,
     RefreshConflict,
     SessionNotFound,
+    SubjectNotFound,
     TokenExpired,
     TokenRevoked,
     TokenTampered,
@@ -287,11 +288,31 @@ class AuthService:
         return ok
 
     # ---- 会话治理 ----
+    def _require_subject(self, subject: str) -> None:
+        """治理判定第 3 步：认证、权限都通过后，确认目标主体确实存在。
+
+        主体从未注册时抛 SubjectNotFound（404），与"主体存在但当前没有
+        活会话/没有任何会话"的成功空结果严格区分，不把不存在伪装成空操作。
+        """
+        if self.store.get_user(subject) is None:
+            log.info(
+                "治理目标缺失 operator_target=%s step=3_subject_existence "
+                "reason=subject_not_found",
+                subject,
+            )
+            raise SubjectNotFound(f"目标主体 {subject} 不存在")
+
     def list_sessions(self, subject: str) -> list[SessionView]:
-        """按主体列出会话（标识/创建时间/状态，不含令牌内容）。"""
+        """按主体列出会话（标识/创建时间/状态，不含令牌内容）。
+
+        目标主体从未注册时抛 SubjectNotFound；主体存在但没有任何会话时
+        正常返回空列表（与"不存在"区分）。
+        """
+        self._require_subject(subject)
         views = self.store.list_sessions_of(subject)
         log.info(
-            "列出会话 operator_target=%s count=%d statuses=%s",
+            "列出会话 operator_target=%s step=3_subject_existence detail=subject_exists "
+            "count=%d statuses=%s",
             subject, len(views),
             ",".join(f"{v.sid}:{v.status}" for v in views) or "(none)",
         )
@@ -326,9 +347,18 @@ class AuthService:
         return "revoked"
 
     def revoke_subject_sessions(self, subject: str) -> int:
-        """一次性注销主体名下仍存活的会话；返回实际注销数量。"""
+        """一次性注销主体名下仍存活的会话；返回实际注销数量。
+
+        目标主体从未注册时抛 SubjectNotFound，不把不存在伪装成一次
+        成功的空操作（count=0）；主体存在但没有活会话时正常返回 0。
+        """
+        self._require_subject(subject)
         count = self.store.revoke_all_sessions_of(subject, self.clock.now())
-        log.info("批量注销会话 subject=%s revoked_count=%d", subject, count)
+        log.info(
+            "批量注销会话 operator_target=%s step=3_subject_existence detail=subject_exists "
+            "revoked_count=%d",
+            subject, count,
+        )
         return count
 
     def revoke_subject(self, username: str) -> None:

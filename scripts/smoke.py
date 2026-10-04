@@ -52,6 +52,12 @@ def main() -> None:
     step("注销后 carol 旧令牌(401)", http.get("/docs/doc-1", headers=H(carol2["access_token"])))
     step("不存在会话注销(404)", http.post("/admin/sessions/nope/revoke", headers=H(alice2["access_token"])))
 
+    # 按主体治理：不存在的主体必须明确 404，不能伪装成成功的空操作；
+    # 已注册主体（carol，其会话此前已被批量注销）列会话仍是 200
+    step("不存在主体列会话(404)", http.get("/admin/subjects/ghost/sessions", headers=H(alice2["access_token"])))
+    step("不存在主体批量注销(404)", http.post("/admin/subjects/ghost/sessions/revoke", headers=H(alice2["access_token"])))
+    step("存在主体列会话(200)", http.get("/admin/subjects/carol/sessions", headers=H(alice2["access_token"])))
+
     ctx.clock.advance(901)
     step("访问令牌过期(401)", http.get("/docs/doc-1", headers=H(alice2["access_token"])))
 

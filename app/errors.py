@@ -86,3 +86,14 @@ class SessionNotFound(AuthError):
 
     code = "session_not_found"
     status_code = 404
+
+
+class SubjectNotFound(AuthError):
+    """治理目标主体（用户名）从未注册，与"主体存在但没有活会话"严格区分。
+
+    仅在认证与 admin:revoke 权限都通过后才可能抛出，因此不会向无权
+    调用方泄露主体是否存在。
+    """
+
+    code = "subject_not_found"
+    status_code = 404

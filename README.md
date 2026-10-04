@@ -8,7 +8,9 @@
 2. **旧刷新令牌重复使用的安全处置**：短窗口内幂等重试 vs 窗口外（或更早旧令牌）
    判定泄露并把**整串令牌作废**，结论与普通注销/过期/篡改严格可区分；
 3. 基于角色与权限范围的访问控制（未认证 / 越权 / 资源不存在严格可区分）+ 三种粒度吊销；
-4. **按主体的会话治理**：列会话、批量注销，沿用"认证→鉴权→目标存在性"顺序；
+4. **按主体的会话治理**：列会话、批量注销，沿用"认证→鉴权→目标存在性"顺序，
+   目标主体从未注册时两个入口都明确返回 404 `subject_not_found`，
+   不把不存在伪装成成功的空操作；
 5. 权限模型演进的即时语义与时钟偏移下的确定性临界判定。
 
 ## 运行
@@ -28,7 +30,7 @@ uv run pytest -s -o log_cli=true -o log_cli_level=INFO
 # 或安静模式：uv run pytest -q
 ```
 
-53 个用例（原有 39 个全部保留并按新语义更新），分布：
+61 个用例（原有 53 个全部保留、无回归 + 新增 8 个），分布：
 
 | 文件 | 覆盖内容 |
 | --- | --- |
@@ -39,6 +41,7 @@ uv run pytest -s -o log_cli=true -o log_cli_level=INFO
 | `tests/test_permission_evolution.py` | 角色权限新增/收窄对**既有令牌**即时生效、逐条独立、轮换令牌同样跟随 |
 | `tests/test_decision_ordering.py` | 多重失败叠加时的固定归类优先级、`now == exp` 临界确定性 |
 | `tests/test_refresh_leak_and_sessions.py` | 整串作废后访问拒绝且与普通注销区分、作废不影响重新登录、过期优先于作废、按主体列会话（不暴露令牌）、`revoked/compromised` 状态、批量注销后重新登录入列、单会话注销三态、治理入口认证/鉴权顺序 |
+| `tests/test_subject_governance_existence.py` | **按主体两个治理入口对不存在目标返回 404 `subject_not_found`**、存在但无会话返回 200 空结果（不误判 404）、无令牌/错令牌（401）与无权限（403）时存在/不存在目标响应逐字节一致、重复判定结论稳定 |
 
 `auth` / `access` logger 在每次判定时打印**判定依据**（user/sid/jti/required/held）
 与**关键令牌/会话状态变化**（签发、轮换 old_jti→new_jti、seq、chain_len、
@@ -66,9 +69,11 @@ uv run pytest -s -o log_cli=true -o log_cli_level=INFO
   会话从不存在时返回 404 `session_not_found`
 - `GET /admin/subjects/{username}/sessions` —— 按主体列出会话
   （`sid`/`created_at`/`status`/`rotation_seq` 等，**不含任何令牌内容**）；
-  `status ∈ active | revoked | compromised`
+  `status ∈ active | revoked | compromised`；
+  目标主体从未注册时返回 404 `subject_not_found`（主体存在但无会话则是 200 空列表）
 - `POST /admin/subjects/{username}/sessions/revoke` —— 一次性注销该主体名下仍存活的
-  会话，返回 `revoked_count`（已注销/已作废的不重复计数）
+  会话，返回 `revoked_count`（已注销/已作废的不重复计数）；
+  目标主体从未注册时返回 404 `subject_not_found`（主体存在但无活会话则是 200、计数 0）
 - `POST /admin/revoke/subject/{username}` —— 主体级吊销（时间戳语义）
 - `POST /admin/revoke/all` —— 全局吊销
 
@@ -92,6 +97,7 @@ uv run pytest -s -o log_cli=true -o log_cli_level=INFO
 | 403 | `forbidden` | 已认证但缺少所需权限（`reason=missing_permission:<p>`） |
 | 404 | `resource_not_found` | **权限通过后**才判定的资源缺失 |
 | 404 | `session_not_found` | **认证+鉴权通过后**才判定的治理目标会话不存在（与"存在但已被清掉"区分） |
+| 404 | `subject_not_found` | **认证+鉴权通过后**才判定的治理目标主体（用户名）从未注册（与"主体存在但没有活会话"区分） |
 
 ## 令牌生命周期
 
@@ -207,13 +213,24 @@ payload = {jti, sub, sid, kind, iat, exp, ver}   # kind ∈ access|refresh
 - `POST /admin/subjects/{username}/sessions/revoke`：一次性注销该主体名下所有
   `active` 会话，返回 `revoked_count`；`revoked`/`compromised` 的不重复计数，
   再次调用返回 0（幂等）。注销后该主体重新登录照常成功，新会话以 `active` 入列。
+- **目标主体不存在的处理**：两个按主体的治理入口都严格区分
+  「主体从未注册」与「主体存在、只是当前没有（活）会话」：
+  - 目标用户名从未注册：两个入口都返回 **404 `subject_not_found`**，
+    不再把不存在伪装成一次成功的空操作（旧行为是 200 + `count=0`/`revoked_count=0`）；
+  - 主体存在但没有任何会话：列会话返回 **200 空列表**；
+  - 主体存在但没有活会话（已全部注销/作废）：批量注销返回 **200 `revoked_count=0`**，
+    重复调用仍为 0；之后重新登录成功，新会话以 `active` 重新入列；
+  - 同一时刻反复判定同一不存在目标，结论稳定一致（确定性时钟 + 只读存在性检查）。
 - `POST /admin/sessions/{sid}/revoke` 的返回 `result` 三态可区分：
   `revoked`（本来存在、本次刚清掉）/ `already_revoked`（此前已注销或已作废）/
-  HTTP 404 `session_not_found`（该 sid 从不存在）。
+  HTTP 404 `session_not_found`（该 sid 从不存在）。**按主体的两个入口对不存在目标
+  返回 404 `subject_not_found`，判定顺序与此处的单会话注销完全一致。**
 - 所有治理入口与资源访问一样，严格按
   **① 认证 → ② 权限（`admin:revoke`）→ ③ 目标存在性** 的顺序判定：
-  未认证一律 401、无权一律 403（此时不会透露目标会话/主体是否存在），
-  只有认证与权限都通过后，才可能得到 404/200。
+  未认证（没带令牌或令牌非法/过期/已吊销）一律 401、无权一律 403
+  （此时**不会**透露目标会话/主体是否存在——对存在与不存在目标的响应逐字节一致），
+  只有认证与权限都通过后，才可能得到 404（`session_not_found`/`subject_not_found`）
+  或 200。
 
 ## 时钟与过期的确定性语义
 
@@ -232,7 +249,7 @@ payload = {jti, sub, sid, kind, iat, exp, ver}   # kind ∈ access|refresh
 
 ```
 app/
-  errors.py          # 错误类型 → error 码 / HTTP 状态码（含 refresh_chain_revoked / session_not_found）
+  errors.py          # 错误类型 → error 码 / HTTP 状态码（含 refresh_chain_revoked / session_not_found / subject_not_found）
   clock.py           # 可控时钟（推进 / 偏移）
   tokens.py          # Claims、HMAC 签发/验签、过期临界判定
   storage.py         # 线程安全内存存储 + CAS 轮换原语(含 RotationRecord) + 泄露终态 +
@@ -241,7 +258,7 @@ app/
   access_control.py  # 认证→鉴权→资源 三段式 Guard
   api.py             # FastAPI 路由与统一 AuthError 处理（含会话治理端点）
   bootstrap.py       # 种子数据与组装
-tests/               # 53 个用例（见上表）
+tests/               # 61 个用例（见上表）
 scripts/smoke.py     # 端到端冒烟（含窗口重试、整串作废、会话治理）
 main.py              # ASGI 入口
 ```
@@ -258,6 +275,8 @@ main.py              # ASGI 入口
 
 ```bash
 uv run pytest -s -o log_cli=true -o log_cli_level=INFO   # 全量用例 + 判定日志
-uv run python scripts/smoke.py                            # 端到端冒烟
+uv run pytest tests/test_subject_governance_existence.py -v \
+    -o log_cli=true -o log_cli_level=INFO                # 只看主体存在性这批用例（含①②③判定步骤日志）
+uv run python scripts/smoke.py                            # 端到端冒烟（含不存在主体两入口 404）
 uv run uvicorn main:app --reload                          # 交互调试 http://127.0.0.1:8000/docs
 ```
