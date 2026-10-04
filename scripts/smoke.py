@@ -51,6 +51,8 @@ def main() -> None:
     step("批量注销 carol(200)", http.post("/admin/subjects/carol/sessions/revoke", headers=H(alice2["access_token"])))
     step("注销后 carol 旧令牌(401)", http.get("/docs/doc-1", headers=H(carol2["access_token"])))
     step("不存在会话注销(404)", http.post("/admin/sessions/nope/revoke", headers=H(alice2["access_token"])))
+    step("不存在主体列会话(404)", http.get("/admin/subjects/ghost/sessions", headers=H(alice2["access_token"])))
+    step("不存在主体批量注销(404)", http.post("/admin/subjects/ghost/sessions/revoke", headers=H(alice2["access_token"])))
 
     ctx.clock.advance(901)
     step("访问令牌过期(401)", http.get("/docs/doc-1", headers=H(alice2["access_token"])))

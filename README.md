@@ -28,7 +28,7 @@ uv run pytest -s -o log_cli=true -o log_cli_level=INFO
 # 或安静模式：uv run pytest -q
 ```
 
-53 个用例（原有 39 个全部保留并按新语义更新），分布：
+62 个用例（原有 53 个全部保留），分布：
 
 | 文件 | 覆盖内容 |
 | --- | --- |
@@ -39,6 +39,7 @@ uv run pytest -s -o log_cli=true -o log_cli_level=INFO
 | `tests/test_permission_evolution.py` | 角色权限新增/收窄对**既有令牌**即时生效、逐条独立、轮换令牌同样跟随 |
 | `tests/test_decision_ordering.py` | 多重失败叠加时的固定归类优先级、`now == exp` 临界确定性 |
 | `tests/test_refresh_leak_and_sessions.py` | 整串作废后访问拒绝且与普通注销区分、作废不影响重新登录、过期优先于作废、按主体列会话（不暴露令牌）、`revoked/compromised` 状态、批量注销后重新登录入列、单会话注销三态、治理入口认证/鉴权顺序 |
+| `tests/test_subject_governance_unknown_subject.py` | **目标主体不存在**：列会话/批量注销均 404 `subject_not_found`、已注册但无会话不误判、未认证/无权限对存在与不存在主体结论逐字节一致（不泄露存在性）、判定顺序 认证→权限→存在性、反复判定结论一致、已存在主体治理流程不回归 |
 
 `auth` / `access` logger 在每次判定时打印**判定依据**（user/sid/jti/required/held）
 与**关键令牌/会话状态变化**（签发、轮换 old_jti→new_jti、seq、chain_len、
@@ -66,9 +67,11 @@ uv run pytest -s -o log_cli=true -o log_cli_level=INFO
   会话从不存在时返回 404 `session_not_found`
 - `GET /admin/subjects/{username}/sessions` —— 按主体列出会话
   （`sid`/`created_at`/`status`/`rotation_seq` 等，**不含任何令牌内容**）；
-  `status ∈ active | revoked | compromised`
+  `status ∈ active | revoked | compromised`；
+  主体从未注册时返回 404 `subject_not_found`（与"存在但没有会话"的 200 空列表区分）
 - `POST /admin/subjects/{username}/sessions/revoke` —— 一次性注销该主体名下仍存活的
-  会话，返回 `revoked_count`（已注销/已作废的不重复计数）
+  会话，返回 `revoked_count`（已注销/已作废的不重复计数）；
+  主体从未注册时返回 404 `subject_not_found`（不返回 `revoked_count=0` 伪装成功）
 - `POST /admin/revoke/subject/{username}` —— 主体级吊销（时间戳语义）
 - `POST /admin/revoke/all` —— 全局吊销
 
@@ -92,6 +95,7 @@ uv run pytest -s -o log_cli=true -o log_cli_level=INFO
 | 403 | `forbidden` | 已认证但缺少所需权限（`reason=missing_permission:<p>`） |
 | 404 | `resource_not_found` | **权限通过后**才判定的资源缺失 |
 | 404 | `session_not_found` | **认证+鉴权通过后**才判定的治理目标会话不存在（与"存在但已被清掉"区分） |
+| 404 | `subject_not_found` | **认证+鉴权通过后**才判定的治理目标主体不存在（与"主体存在但没有会话"区分） |
 
 ## 令牌生命周期
 
@@ -210,6 +214,15 @@ payload = {jti, sub, sid, kind, iat, exp, ver}   # kind ∈ access|refresh
 - `POST /admin/sessions/{sid}/revoke` 的返回 `result` 三态可区分：
   `revoked`（本来存在、本次刚清掉）/ `already_revoked`（此前已注销或已作废）/
   HTTP 404 `session_not_found`（该 sid 从不存在）。
+- **目标主体不存在的处理**：两个按主体入口（列会话、批量注销）对**从未注册**的
+  用户名一律返回 HTTP 404 `subject_not_found`，与"主体已注册但当前没有会话"
+  （列会话 200 空列表 / 批量注销 200 `revoked_count=0`）严格区分——
+  不存在不会被伪装成一次成功的空操作。判定与单个会话注销走同一条固定顺序
+  **① 认证 → ② 权限（`admin:revoke`）→ ③ 目标存在性**：
+  未认证一律 401、无权一律 403，且这两类失败对"存在"与"不存在"的主体
+  响应完全相同，存在性不会透给无权调用者；只有认证与权限都通过后，
+  才可能得到 404 `subject_not_found`。主体是否存在的判定只看注册台账
+  （`Store.get_user`），与有没有会话无关，因此同一时刻反复判定结论一致。
 - 所有治理入口与资源访问一样，严格按
   **① 认证 → ② 权限（`admin:revoke`）→ ③ 目标存在性** 的顺序判定：
   未认证一律 401、无权一律 403（此时不会透露目标会话/主体是否存在），
@@ -232,7 +245,7 @@ payload = {jti, sub, sid, kind, iat, exp, ver}   # kind ∈ access|refresh
 
 ```
 app/
-  errors.py          # 错误类型 → error 码 / HTTP 状态码（含 refresh_chain_revoked / session_not_found）
+  errors.py          # 错误类型 → error 码 / HTTP 状态码（含 refresh_chain_revoked / session_not_found / subject_not_found）
   clock.py           # 可控时钟（推进 / 偏移）
   tokens.py          # Claims、HMAC 签发/验签、过期临界判定
   storage.py         # 线程安全内存存储 + CAS 轮换原语(含 RotationRecord) + 泄露终态 +
@@ -241,7 +254,7 @@ app/
   access_control.py  # 认证→鉴权→资源 三段式 Guard
   api.py             # FastAPI 路由与统一 AuthError 处理（含会话治理端点）
   bootstrap.py       # 种子数据与组装
-tests/               # 53 个用例（见上表）
+tests/               # 62 个用例（见上表）
 scripts/smoke.py     # 端到端冒烟（含窗口重试、整串作废、会话治理）
 main.py              # ASGI 入口
 ```
@@ -254,6 +267,9 @@ main.py              # ASGI 入口
   新版本改为——窗口内 200 幂等回放、窗口外（或跨轮换的更早旧令牌）401
   `refresh_chain_revoked` 并整串作废。错误类 `TokenReplayed` 与错误码
   `refresh_replayed` 保留在代码中以兼容旧引用，但接口不再返回。
+- 另一处行为收紧：按主体的两个治理入口（列会话、批量注销）对**从未注册**的
+  目标主体，原来返回 200 + 空结果（`count=0` / `revoked_count=0`），
+  现在返回 404 `subject_not_found`；已注册主体的行为完全不变。
 - 本地验证：
 
 ```bash

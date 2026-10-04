@@ -86,3 +86,10 @@ class SessionNotFound(AuthError):
 
     code = "session_not_found"
     status_code = 404
+
+
+class SubjectNotFound(AuthError):
+    """治理目标主体不存在（从未注册），与"主体存在但没有会话"严格区分。"""
+
+    code = "subject_not_found"
+    status_code = 404

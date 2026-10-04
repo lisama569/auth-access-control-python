@@ -31,6 +31,7 @@ from .errors import (
     RefreshChainRevoked,
     RefreshConflict,
     SessionNotFound,
+    SubjectNotFound,
     TokenExpired,
     TokenRevoked,
     TokenTampered,
@@ -287,8 +288,30 @@ class AuthService:
         return ok
 
     # ---- 会话治理 ----
+    def _require_subject(self, subject: str, *, operation: str) -> None:
+        """治理目标主体存在性判定（在认证、鉴权通过之后才走到这里）。
+
+        主体从未注册 => SubjectNotFound(404)，与"主体存在但没有会话"
+        严格区分；已注册（含无会话）主体照常放行。
+        """
+        if self.store.get_user(subject) is None:
+            log.info(
+                "会话治理被拒 operation=%s target=%s reason=subject_not_found "
+                "detail=subject_never_registered",
+                operation, subject,
+            )
+            raise SubjectNotFound(f"目标主体 {subject} 不存在")
+        log.info(
+            "会话治理目标存在性通过 operation=%s target=%s reason=subject_exists",
+            operation, subject,
+        )
+
     def list_sessions(self, subject: str) -> list[SessionView]:
-        """按主体列出会话（标识/创建时间/状态，不含令牌内容）。"""
+        """按主体列出会话（标识/创建时间/状态，不含令牌内容）。
+
+        主体不存在时抛出 SubjectNotFound；主体存在但没有会话返回空列表。
+        """
+        self._require_subject(subject, operation="list_sessions")
         views = self.store.list_sessions_of(subject)
         log.info(
             "列出会话 operator_target=%s count=%d statuses=%s",
@@ -326,7 +349,11 @@ class AuthService:
         return "revoked"
 
     def revoke_subject_sessions(self, subject: str) -> int:
-        """一次性注销主体名下仍存活的会话；返回实际注销数量。"""
+        """一次性注销主体名下仍存活的会话；返回实际注销数量。
+
+        主体不存在时抛出 SubjectNotFound；主体存在但没有活会话返回 0。
+        """
+        self._require_subject(subject, operation="revoke_subject_sessions")
         count = self.store.revoke_all_sessions_of(subject, self.clock.now())
         log.info("批量注销会话 subject=%s revoked_count=%d", subject, count)
         return count
